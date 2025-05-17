@@ -54,6 +54,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+from dotenv import load_dotenv
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 
@@ -75,6 +76,14 @@ try:
 except Exception:
     _NVML_LOADED = False
 
+dotenv_path = "docker/.env"
+if not os.path.exists(dotenv_path):
+    print(f"Warning: {dotenv_path} file not found. Environment variables might not be loaded.")
+else:
+    load_dotenv(dotenv_path=dotenv_path)  # Load variables from .env file into os.environ
+# Check that important env variables are now set
+if os.getenv("R2_DATASET_ACCOUNT_ID") is None:
+    print("Warning: R2_DATASET_ACCOUNT_ID not set. Ensure docker/.env is present and contains this key.")
 # -------------------------------- Dataclasses ---------------------------------
 
 @dataclass
@@ -596,7 +605,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import s3fs, os
+
+    fs = s3fs.S3FileSystem(
+        key=os.getenv("R2_DATASET_READ_ACCESS_KEY_ID"),
+        secret=os.getenv("R2_DATASET_READ_SECRET_ACCESS_KEY"),
+        client_kwargs={
+            "endpoint_url": "https://dd08f378791881bf6bbb7f161c78a220.r2.cloudflarestorage.com",
+            "region_name": "auto",                       # <-- change here
+        },
+    )
+
+    print(fs.ls("edu-dataset", refresh=True)[:10])  
     torch.backends.cudnn.benchmark = True  # enable heuristic
     main_args = parse_args()
     benchmark = LLMInferenceBenchmark(main_args)
+    benchmark.run()
     benchmark.run()

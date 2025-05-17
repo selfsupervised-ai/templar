@@ -38,6 +38,8 @@ dependencies = [
     "pynvml>=12.0.0",
     "flashinfer-python>=0.2.5",
     "hf-xet>=1.1.1",
+    "matplotlib>=3.10.1",
+    "seaborn>=0.13.2",
 ]
 
 [project.optional-dependencies]
