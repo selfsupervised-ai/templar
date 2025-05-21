@@ -150,27 +150,32 @@ def build_bt_config(args: argparse.Namespace) -> bt.Config:
     return cfg
 
 
-async def _fetch_latest_checkpoint(cfg: bt.Config, hparams, netuid: int) -> Tuple[dict, tplr.comms.Comms]:
+async def _fetch_latest_checkpoint(cfg: bt.Config, hparams, netuid: int) -> Optional[Tuple[dict, tplr.comms.Comms]]:
     """Async wrapper replicating Evaluator.load_latest_model()."""
-    wallet = bt.wallet(config=cfg)
-    subtensor = bt.subtensor(config=cfg)
-    metagraph = subtensor.metagraph(netuid=netuid)
+    try:
+        wallet = bt.wallet(config=cfg)
+        subtensor = bt.subtensor(config=cfg)
+        metagraph = subtensor.metagraph(netuid=netuid)
 
-    comms = tplr.comms.Comms(
-        wallet=wallet,
-        save_location="/tmp",
-        key_prefix="model",
-        config=cfg,
-        netuid=netuid,
-        metagraph=metagraph,
-        hparams=hparams,
-        uid=1,
-    )
-    result = await comms.get_latest_checkpoint(version=tplr.__version__)
-    if not result:
-        raise RuntimeError("No checkpoint available via comms")
-    checkpoint, _ = result
-    return checkpoint, comms
+        comms = tplr.comms.Comms(
+            wallet=wallet,
+            save_location="/tmp",
+            key_prefix="model",
+            config=cfg,
+            netuid=netuid,
+            metagraph=metagraph,
+            hparams=hparams,
+            uid=1,
+        )
+        result = await comms.get_latest_checkpoint(version=tplr.__version__)
+        if not result:
+            tplr.logger.warning("No checkpoint available via comms")
+            return None
+        checkpoint, _ = result
+        return checkpoint, comms
+    except Exception as e:
+        tplr.logger.warning(f"Failed to fetch checkpoint via comms: {e}")
+        return None
 
 
 def load_llama_model(
@@ -199,16 +204,24 @@ def load_llama_model(
                 wallet_hotkey=os.getenv("WALLET_HOTKEY")
             ))
             tplr.logger.info("Fetching latest checkpoint via comms…")
-            checkpoint = asyncio.run(_fetch_latest_checkpoint(cfg, hparams, netuid))[0]
-            state = {k: v.to(torch.bfloat16) for k, v in checkpoint["model_state_dict"].items()}
-            model.load_state_dict(state)
+            
+            # Handle case where checkpoint fetching fails
+            fetch_result = asyncio.run(_fetch_latest_checkpoint(cfg, hparams, netuid))
+            if fetch_result is not None:
+                checkpoint, _ = fetch_result
+                state = {k: v.to(torch.bfloat16) for k, v in checkpoint["model_state_dict"].items()}
+                model.load_state_dict(state)
+            else:
+                tplr.logger.warning("Failed to fetch checkpoint. Using random initialization.")
+                # Continue with random initialization
         elif tplr_checkpoint:
             tplr.logger.info(f"Loading checkpoint from {tplr_checkpoint}")
             ckpt = torch.load(tplr_checkpoint, map_location="cpu")
             state = ckpt.get("model_state_dict", ckpt)
             model.load_state_dict({k: v.to(torch.bfloat16) for k, v in state.items()})
-    except RuntimeError as e:
-        tplr.logger.info(e)
+    except Exception as e:
+        tplr.logger.warning(f"Error loading model: {e}")
+        tplr.logger.info("Continuing with random initialization.")
 
     # optional compile
     if compile_mode == "thunder":
