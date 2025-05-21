@@ -186,7 +186,11 @@ def load_llama_model(
     model.to(device=device, dtype=torch.bfloat16)
 
     if use_latest and tplr_checkpoint is None:
-        cfg = bt_cfg or build_bt_config(argparse.Namespace(netuid=netuid))
+        cfg = bt_cfg or build_bt_config(argparse.Namespace(
+            netuid=netuid,
+            wallet_name=os.getenv("WALLET_NAME"),
+            wallet_hotkey=os.getenv("WALLET_HOTKEY")
+        ))
         tplr.logger.info("Fetching latest checkpoint via comms…")
         checkpoint = asyncio.run(_fetch_latest_checkpoint(cfg, hparams, netuid))[0]
         state = {k: v.to(torch.bfloat16) for k, v in checkpoint["model_state_dict"].items()}
