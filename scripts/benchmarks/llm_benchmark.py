@@ -371,6 +371,16 @@ def run_experiment(args, compile_mode=None, pin_mem=False, persistent=False, col
     ds = get_dataset(args.dataset, args.seq_len)
     dl = build_dataloader(ds, tokenizer, args.seq_len, args.batch_size, pin_mem, persistent, collate_cuda)
 
+    # Warm-up: run a few batches to trigger compilation, caching, etc.
+    model.eval()
+    warmup_batches = 3
+    for idx, batch in enumerate(dl):
+        if idx >= warmup_batches:
+            break
+        batch = {k: v.to(model.device, non_blocking=True) for k, v in batch.items()}
+        with torch.no_grad():
+            _ = model(**batch, use_cache=False)
+
     profile_path = Path("traces") / f"{args.exp}_{time.time_ns()}" if profile else None
     metrics = measure_throughput(model, dl, args.steps, use_profiler=profile, profile_path=profile_path)
 
