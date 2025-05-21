@@ -136,8 +136,14 @@ def build_bt_config(args: argparse.Namespace) -> bt.Config:
     """Create a `bt.Config` with subnet params + any Bittensor CLI flags."""
     p = argparse.ArgumentParser(add_help=False)
     bt.subtensor.add_args(p)
+    bt.wallet.add_args(p)  # Add wallet args to ensure wallet config is initialized
     cli_args, _ = p.parse_known_args([])  # defaults only
     cfg = bt.config(p)
+    
+    # Explicitly initialize wallet config if it doesn't exist
+    if not hasattr(cfg, 'wallet'):
+        cfg.wallet = bt.config()
+        
     cfg.wallet.name = args.wallet_name
     cfg.wallet.hotkey = args.wallet_hotkey
     cfg.netuid = args.netuid
