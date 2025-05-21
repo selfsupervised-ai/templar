@@ -605,14 +605,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import s3fs, os
+    import os
+
+    import s3fs
 
     fs = s3fs.S3FileSystem(
         key=os.getenv("R2_DATASET_READ_ACCESS_KEY_ID"),
         secret=os.getenv("R2_DATASET_READ_SECRET_ACCESS_KEY"),
         client_kwargs={
             "endpoint_url": "https://dd08f378791881bf6bbb7f161c78a220.r2.cloudflarestorage.com",
-            "region_name": "auto",                       # <-- change here
+            "region_name": "auto",                       
         },
     )
 
@@ -620,5 +622,4 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True  # enable heuristic
     main_args = parse_args()
     benchmark = LLMInferenceBenchmark(main_args)
-    benchmark.run()
     benchmark.run()
