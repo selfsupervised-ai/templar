@@ -442,12 +442,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
-    registry[args.exp](args)
-    wandb.finish()
-
-
-if __name__ == "__main__":
     main()
