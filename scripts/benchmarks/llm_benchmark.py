@@ -137,6 +137,8 @@ def build_bt_config(args: argparse.Namespace) -> bt.Config:
     bt.subtensor.add_args(p)
     cli_args, _ = p.parse_known_args([])  # defaults only
     cfg = bt.config(p)
+    cfg.wallet.name = args.wallet_name
+    cfg.wallet.hotkey = args.wallet_hotkey
     cfg.netuid = args.netuid
     return cfg
 
@@ -441,6 +443,8 @@ def parse_args():
     p.add_argument("--tplr_checkpoint", type=str, default=None)
     p.add_argument("--use_latest", default=True)
     p.add_argument("--netuid", type=int, default=3)
+    p.add_argument("--wallet_name", default=os.getenv("WALLET_NAME"))
+    p.add_argument("--wallet_hotkey", default=os.getenv("WALLET_HOTKEY"))
     return p.parse_args()
 
 
