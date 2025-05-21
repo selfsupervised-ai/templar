@@ -398,7 +398,7 @@ def exp_compile(args):
 
 @register("dataloader")
 def exp_dataloader(args):
-    run_experiment(args, pin_mem=True, persistent=True, collate_cuda=True)
+    run_experiment(args, pin_mem=True, persistent=True, collate_cuda=False)
 
 
 @register("full")
