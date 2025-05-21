@@ -440,7 +440,7 @@ def exp_compile(args):
     run_experiment(args, compile_mode="compile", pin_mem=True, persistent=True, inference_mode=True)
 
 @register("thunder")
-def exp_compile(args):
+def exp_thunder(args):
     torch.backends.cuda.enable_flash_sdp(True)
     run_experiment(args, compile_mode="thunder", pin_mem=True, persistent=True, inference_mode=True)
 
@@ -453,7 +453,7 @@ def exp_dataloader(args):
 def exp_full(args):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.enable_flash_sdp(True)
-    mode = "thunder" if thunder else "compile"
+    mode = "compile"
     run_experiment(args, compile_mode=mode, pin_mem=True, persistent=True, collate_cuda=False, inference_mode=True)
 
 
