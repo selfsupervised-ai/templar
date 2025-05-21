@@ -215,6 +215,7 @@ def measure_throughput(
     steps: int,
     use_profiler: bool = False,
     profile_path: Optional[Path] = None,
+    inference_mode: bool = False,
 ) -> BenchmarkMetrics:
     model.eval()
     profiler = Profiler(use_profiler, profile_path or Path("traces"))
@@ -244,7 +245,12 @@ def measure_throughput(
             try:
                 ts = time.time()
                 batch = {k: v.to(model.device, non_blocking=True) for k, v in batch.items()}
-                _ = model(**batch, use_cache=False)
+                if inference_mode:
+                    with torch.inference_mode():
+                        _ = model(**batch, use_cache=False)
+                else:
+                    with torch.no_grad():
+                        _ = model(**batch, use_cache=False)
                 te = time.time()
 
                 in_tok = batch["input_ids"].numel()
@@ -360,7 +366,7 @@ def register(name):
 
 # Base experiment template
 
-def run_experiment(args, compile_mode=None, pin_mem=False, persistent=False, collate_cuda=False, profile=False):
+def run_experiment(args, compile_mode=None, pin_mem=False, persistent=False, collate_cuda=False, profile=False, inference_mode=False):
     model, tokenizer = load_llama_model(
         device=args.device,
         compile_mode=compile_mode,
@@ -378,11 +384,11 @@ def run_experiment(args, compile_mode=None, pin_mem=False, persistent=False, col
         if idx >= warmup_batches:
             break
         batch = {k: v.to(model.device, non_blocking=True) for k, v in batch.items()}
-        with torch.no_grad():
+        with torch.inference_mode():
             _ = model(**batch, use_cache=False)
 
     profile_path = Path("traces") / f"{args.exp}_{time.time_ns()}" if profile else None
-    metrics = measure_throughput(model, dl, args.steps, use_profiler=profile, profile_path=profile_path)
+    metrics = measure_throughput(model, dl, args.steps, use_profiler=profile, profile_path=profile_path, inference_mode=inference_mode)
 
     # Log to wandb
     wandb.log(metrics.__dict__)
@@ -396,19 +402,19 @@ def exp_baseline(args):
 @register("simple")
 def exp_simple(args):
     torch.backends.cudnn.benchmark = True
-    run_experiment(args, pin_mem=True, persistent=True)
+    run_experiment(args, pin_mem=True, persistent=True, inference_mode=True)
 
 
 @register("compile")
 def exp_compile(args):
     torch.backends.cuda.enable_flash_sdp(True)
     mode = "thunder" if thunder else "compile"
-    run_experiment(args, compile_mode=mode, pin_mem=True, persistent=True)
+    run_experiment(args, compile_mode=mode, pin_mem=True, persistent=True, inference_mode=True)
 
 
 @register("dataloader")
 def exp_dataloader(args):
-    run_experiment(args, pin_mem=True, persistent=True, collate_cuda=False)
+    run_experiment(args, pin_mem=True, persistent=True, collate_cuda=False, inference_mode=True)
 
 
 @register("full")
@@ -416,7 +422,7 @@ def exp_full(args):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.enable_flash_sdp(True)
     mode = "thunder" if thunder else "compile"
-    run_experiment(args, compile_mode=mode, pin_mem=True, persistent=True, collate_cuda=False)
+    run_experiment(args, compile_mode=mode, pin_mem=True, persistent=True, collate_cuda=False, inference_mode=True)
 
 
 # ---------------------------------------------------------------------------
