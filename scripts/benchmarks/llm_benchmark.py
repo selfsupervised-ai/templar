@@ -41,12 +41,13 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-import wandb
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (LlamaForCausalLM, PreTrainedTokenizer,
                           default_data_collator, set_seed)
+
+import wandb
 
 try:
     import thunder  # type: ignore
@@ -406,7 +407,7 @@ def parse_args():
     p.add_argument("--seq_len", type=int, default=128)
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--steps", type=int, default=200, help="forward passes to measure")
-    p.add_argument("--dataset", default="lighteval/lighteval-tiny")
+    p.add_argument("--dataset", default="abcorrea/wikitest")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--tplr_checkpoint", type=str, default=None)
     p.add_argument("--use_latest", action="store_true")
@@ -425,6 +426,10 @@ def main():
 
     registry[args.exp](args)
     wandb.finish()
+
+
+if __name__ == "__main__":
+    main()    wandb.finish()
 
 
 if __name__ == "__main__":
