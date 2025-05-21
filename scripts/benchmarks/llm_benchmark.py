@@ -436,7 +436,7 @@ def parse_args():
     p.add_argument("--seq_len", type=int, default=128)
     p.add_argument("--batch_size", type=int, default=100)
     p.add_argument("--steps", type=int, default=200, help="forward passes to measure")
-    p.add_argument("--dataset", default="lucadiliello/english_wikipedia")
+    p.add_argument("--dataset", default="hlarcher/share_gpt_small")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--tplr_checkpoint", type=str, default=None)
     p.add_argument("--use_latest", action="store_true")
