@@ -439,7 +439,7 @@ def parse_args():
     p.add_argument("--dataset", default="abcorrea/wikitest")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--tplr_checkpoint", type=str, default=None)
-    p.add_argument("--use_latest", defualt=True)
+    p.add_argument("--use_latest", default=True)
     p.add_argument("--netuid", type=int, default=3)
     return p.parse_args()
 
