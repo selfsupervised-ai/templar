@@ -42,6 +42,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from datasets import load_dataset
+from dotenv import load_dotenv
 from pynvml import (nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates,
                     nvmlInit, nvmlShutdown)
 from torch.utils.data import DataLoader
@@ -449,6 +450,7 @@ def parse_args():
 
 
 def main():
+    load_dotenv()
     args = parse_args()
     set_seed(args.seed)
     Path("traces").mkdir(exist_ok=True)
