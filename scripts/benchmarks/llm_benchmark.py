@@ -406,7 +406,7 @@ def exp_full(args):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.enable_flash_sdp(True)
     mode = "thunder" if thunder else "compile"
-    run_experiment(args, compile_mode=mode, pin_mem=True, persistent=True, collate_cuda=True)
+    run_experiment(args, compile_mode=mode, pin_mem=True, persistent=True, collate_cuda=False)
 
 
 # ---------------------------------------------------------------------------
