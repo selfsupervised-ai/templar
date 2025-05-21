@@ -42,6 +42,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from datasets import load_dataset
+from pynvml import (nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates,
+                    nvmlInit, nvmlShutdown)
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (LlamaForCausalLM, PreTrainedTokenizer,
@@ -225,12 +227,18 @@ def measure_throughput(
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
         avail_start, _ = torch.cuda.mem_get_info()
+        nvmlInit()
+        handle = nvmlDeviceGetHandleByIndex(0)
+        util_samples = []
     else:
         avail_start = 0
 
     t0_all = time.time()
     with profiler:
         for idx, batch in enumerate(tqdm(dataloader, total=steps, desc="benchmark")):
+            if torch.cuda.is_available():
+                util = nvmlDeviceGetUtilizationRates(handle)
+                util_samples.append(util.gpu)
             if idx >= steps:
                 break
             try:
@@ -271,6 +279,11 @@ def measure_throughput(
     peak_mem = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
     avail_end = torch.cuda.mem_get_info()[0] / 1024**2 if torch.cuda.is_available() else 0
     avail_min = min(avail_start / 1024**2, avail_end) if torch.cuda.is_available() else 0
+    if torch.cuda.is_available():
+        nvmlShutdown()
+        avg_util = sum(util_samples) / len(util_samples) if util_samples else 0.0
+    else:
+        avg_util = 0.0
 
     return BenchmarkMetrics(
         completed=len(latencies),
@@ -297,7 +310,7 @@ def measure_throughput(
         max_total=(max(inputs) + max(outputs)) if inputs and outputs else 0,
         peak_gpu_memory_mib=peak_mem,
         available_gpu_memory_mib=avail_min,
-        gpu_utilization=0.0,  # NVML integration needed
+        gpu_utilization=avg_util,
     )
 
 
@@ -422,6 +435,14 @@ def main():
     wandb.init(project="templar_llama_speed", name=f"{args.exp}_{time.time_ns()}", config=vars(args))
 
     if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    registry[args.exp](args)
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    main()    if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
     registry[args.exp](args)
