@@ -1,340 +1,416 @@
-# benchmark_llama_speed.py
-"""Speed‑ablation harness for Llama 3.1‑8B (bf16)
+"""Templar Llama Benchmarking Script
 
-This standalone script lets you reproduce the optimisation steps described in
-our proposal.  Each step is a **named experiment**; run them individually or as
-an end‑to‑end sweep.  All runs are logged to `wandb`, and every stage emits a
-throughput metric (`tokens_per_second`) and, optionally, a `torch.profiler`
-Chrome‑trace for deeper inspection.
+This script benchmarks inference throughput and latency of LlamaForCausalLM models used in the Templar architecture.
+It supports evaluating both static checkpoints and the latest available model via the Bittensor/TPLR comms system.
 
-Usage examples
---------------
+Key Features:
+    - Automatically fetches and loads the latest model checkpoint from R2.
+    - Uses torch.profiler for optional performance tracing.
+    - Detailed Benchmark Metrics: Computes throughput (req/s, tokens/s), latency (mean, median, p99), and GPU memory stats.
+    - Flexible Execution Modes: Multiple benchmark profiles via `--exp`, supporting dataloader, compilation, and optimizer tuning.
+    - Integration with wandb: All metrics are automatically logged for visualization.
 
-```bash
-#1) baseline profile (writes trace in ./traces/baseline_*.pt)
-python benchmark_llama_speed.py --exp baseline
+Environment Requirements:
+    - Registered Bittensor wallet
+    - Access to TPLR-configured environment for fetching live checkpoints (env vars must be set) 
+    - R2 Dataset access credentials
+    - CUDA-enabled GPU (Ampere+ for BF16 support)
 
-#2)  simple tweaks (no profiler) – compares to baseline in wandb graphs
-python benchmark_llama_speed.py --exp simple
+Usage Examples:
+---------------
+1. Run with latest model from Bittensor:
+    python benchmark_llama_speed.py --exp full --use_latest --netuid 3
 
-#3)  compiled with Thunder JIT & FlashAttention
-python benchmark_llama_speed.py --exp compile
+2. Run with specific checkpoint file:
+    python benchmark_llama_speed.py --exp baseline --tplr_checkpoint /path/to/checkpoint.pt
 
-#4)  data‑loader tuning
-python benchmark_llama_speed.py --exp dataloader
-
-#5)  full stack (compile + dataloader + streams)
-python benchmark_llama_speed.py --exp full --steps 500
-```
-
-A typical workflow is to run the experiments in order and observe the
-throughput gains in the `wandb` dashboard.
-
-Notes
------
-* The script purposely avoids any form of quantisation – the model runs in
-  **BF16** throughout.
-* Tested with PyTorch 2.3, CUDA 12.4, `transformers` 4.41, Thunder nightly ≥ Apr‑2025.
-* **GPU requirements:** Ampere (A100) or Hopper (H100).  Hopper automatically
-  selects FlashAttention‑2 via SDPA when available.
-* The script fetches the *Hugging Face* eval dataset **lighteval/lighteval‑tiny**
-  by default; override with `--dataset`.
+3. Use compiler and FlashAttention:
+    python benchmark_llama_speed.py --exp compile
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import os
+import statistics
 import time
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Callable, Dict
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-import torch.utils.data as tud
 import wandb
 from datasets import load_dataset
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-# transformers / HF
-from transformers import (AutoConfig, AutoTokenizer, LlamaForCausalLM,
+from transformers import (LlamaForCausalLM, PreTrainedTokenizer,
                           default_data_collator, set_seed)
 
-# Optional imports – load lazily
 try:
     import thunder  # type: ignore
 except ImportError:
     thunder = None
 
-try:
-    from flash_attn.layers.rotary import \
-        RotaryEmbedding  # noqa: F401 – check availability
-except ImportError:
-    pass
+# Bittensor & Templar
+import bittensor as bt
 
-# ----------------------------------------------------------------------------
-# Utility helpers
-# ----------------------------------------------------------------------------
+import tplr  # provides load_hparams(), comms, logger, etc.
 
 
-def log_to_wandb(config: Dict):
-    """Initialise wandb in a deterministic (resume‑friendly) way."""
-    wandb.init(
-        project="llama31_8b_speed",
-        name=f"{config['exp']}_{time.strftime('%Y%m%d_%H%M%S')}",
-        config=config,
-        mode=os.getenv("WANDB_MODE", "online"),
-        tags=[config["exp"], config["device"], "bf16"],
+# ---------------------------------------------------------------------------
+# Dataclasses & helpers
+# ---------------------------------------------------------------------------
+@dataclass
+class BenchmarkMetrics:
+    """All the aspects of inference speed"""
+    completed: int
+    failures: int
+    total_input: int
+    total_output: int
+    request_throughput: float
+    input_throughput: float
+    output_throughput: float
+    mean_ttft_ms: float
+    median_ttft_ms: float
+    std_ttft_ms: float
+    p99_ttft_ms: float
+    mean_tpot_ms: float
+    median_tpot_ms: float
+    std_tpot_ms: float
+    p99_tpot_ms: float
+    mean_itl_ms: float
+    median_itl_ms: float
+    std_itl_ms: float
+    p99_itl_ms: float
+    max_input: int
+    max_output: int
+    max_total: int
+    peak_gpu_memory_mib: float
+    available_gpu_memory_mib: float
+    gpu_utilization: float
+
+
+class Profiler:
+    """Thin wrapper around torch.profiler for optional capture."""
+
+    def __init__(self, enabled: bool, logdir: Path | str):
+        self.enabled = enabled
+        if enabled:
+            schedule = torch.profiler.schedule(wait=2, warmup=2, active=6, repeat=1)
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            self.prof = torch.profiler.profile(
+                activities=activities,
+                schedule=schedule,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(str(logdir)),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+        else:
+            self.prof = contextlib.nullcontext()
+
+    def __enter__(self):
+        return self.prof.__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self.prof.__exit__(exc_type, exc_value, traceback)
+
+    def step(self):
+        if self.enabled and hasattr(self.prof, "step"):
+            self.prof.step()
+
+
+# ---------------------------------------------------------------------------
+# Bittensor helper – build minimal config from CLI
+# ---------------------------------------------------------------------------
+
+def build_bt_config(args: argparse.Namespace) -> bt.Config:
+    """Create a `bt.Config` with subnet params + any Bittensor CLI flags."""
+    p = argparse.ArgumentParser(add_help=False)
+    bt.subtensor.add_args(p)
+    cli_args, _ = p.parse_known_args([])  # defaults only
+    cfg = bt.config(p)
+    cfg.netuid = args.netuid
+    return cfg
+
+
+async def _fetch_latest_checkpoint(cfg: bt.Config, hparams, netuid: int) -> Tuple[dict, tplr.comms.Comms]:
+    """Async wrapper replicating Evaluator.load_latest_model()."""
+    wallet = bt.wallet(config=cfg)
+    subtensor = bt.subtensor(config=cfg)
+    metagraph = subtensor.metagraph(netuid=netuid)
+
+    comms = tplr.comms.Comms(
+        wallet=wallet,
+        save_location="/tmp",
+        key_prefix="model",
+        config=cfg,
+        netuid=netuid,
+        metagraph=metagraph,
+        hparams=hparams,
+        uid=1,
+    )
+    result = await comms.get_latest_checkpoint(version=tplr.__version__)
+    if not result:
+        raise RuntimeError("No checkpoint available via comms")
+    checkpoint, _ = result
+    return checkpoint, comms
+
+
+def load_llama_model(
+    *,
+    device: str,
+    compile_mode: Optional[str] = None,
+    tplr_checkpoint: Optional[str] = None,
+    use_latest: bool = False,
+    netuid: int = 3,
+    bt_cfg: Optional[bt.Config] = None,
+) -> Tuple[LlamaForCausalLM, PreTrainedTokenizer]:
+    """Load Templar Llama model.
+
+    Priority: 1) `use_latest` via comms, 2) explicit `tplr_checkpoint`,
+    3) random‑init (no weights).
+    """
+    hparams = tplr.load_hparams()
+    model = LlamaForCausalLM(config=hparams.model_config)
+    model.to(device=device, dtype=torch.bfloat16)
+
+    if use_latest and tplr_checkpoint is None:
+        cfg = bt_cfg or build_bt_config(argparse.Namespace(netuid=netuid))
+        tplr.logger.info("Fetching latest checkpoint via comms…")
+        checkpoint = asyncio.run(_fetch_latest_checkpoint(cfg, hparams, netuid))[0]
+        state = {k: v.to(torch.bfloat16) for k, v in checkpoint["model_state_dict"].items()}
+        model.load_state_dict(state)
+    elif tplr_checkpoint:
+        tplr.logger.info(f"Loading checkpoint from {tplr_checkpoint}")
+        ckpt = torch.load(tplr_checkpoint, map_location="cpu")
+        state = ckpt.get("model_state_dict", ckpt)
+        model.load_state_dict({k: v.to(torch.bfloat16) for k, v in state.items()})
+
+    # optional compile
+    if compile_mode == "thunder":
+        if thunder is None:
+            raise RuntimeError("thunder not installed – `pip install lightning‑thunder --pre`")
+        model = thunder.jit(model, executors=["sdpa", "torchcompile_cat", "nvfuser", "torch"])
+    elif compile_mode == "compile":
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+
+    return model, hparams.tokenizer
+
+
+# ---------------------------------------------------------------------------
+# Benchmarking utils
+# ---------------------------------------------------------------------------
+
+def measure_throughput(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    steps: int,
+    use_profiler: bool = False,
+    profile_path: Optional[Path] = None,
+) -> BenchmarkMetrics:
+    model.eval()
+    profiler = Profiler(use_profiler, profile_path or Path("traces"))
+
+    latencies: List[float] = []
+    inputs: List[int] = []
+    outputs: List[int] = []
+    failures = 0
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        avail_start, _ = torch.cuda.mem_get_info()
+    else:
+        avail_start = 0
+
+    t0_all = time.time()
+    with profiler:
+        for idx, batch in enumerate(tqdm(dataloader, total=steps, desc="benchmark")):
+            if idx >= steps:
+                break
+            try:
+                ts = time.time()
+                batch = {k: v.to(model.device, non_blocking=True) for k, v in batch.items()}
+                _ = model(**batch, use_cache=False)
+                te = time.time()
+
+                in_tok = batch["input_ids"].numel()
+                out_tok = in_tok  # forward‑only
+                lat_ms = (te - ts) * 1_000
+
+                latencies.append(lat_ms)
+                inputs.append(in_tok)
+                outputs.append(out_tok)
+                profiler.step()
+            except Exception as e:
+                tplr.logger.error(f"inference error: {e}")
+                failures += 1
+
+    t1_all = time.time()
+    total_s = t1_all - t0_all
+
+    # stats helpers
+    def stats(arr: List[float]) -> Tuple[float, float, float, float]:
+        if not arr:
+            return (0, 0, 0, 0)
+        mean = statistics.mean(arr)
+        median = statistics.median(arr)
+        std = statistics.stdev(arr) if len(arr) > 1 else 0.0
+        p99 = sorted(arr)[int(len(arr) * 0.99)]
+        return (mean, median, std, p99)
+
+    tt_mean, tt_med, tt_std, tt_p99 = stats(latencies)
+    tpot_list = [l / o if o else 0 for l, o in zip(latencies, outputs)]
+    tp_mean, tp_med, tp_std, tp_p99 = stats(tpot_list)
+
+    peak_mem = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
+    avail_end = torch.cuda.mem_get_info()[0] / 1024**2 if torch.cuda.is_available() else 0
+    avail_min = min(avail_start / 1024**2, avail_end) if torch.cuda.is_available() else 0
+
+    return BenchmarkMetrics(
+        completed=len(latencies),
+        failures=failures,
+        total_input=sum(inputs),
+        total_output=sum(outputs),
+        request_throughput=len(latencies) / total_s if total_s else 0,
+        input_throughput=sum(inputs) / total_s if total_s else 0,
+        output_throughput=sum(outputs) / total_s if total_s else 0,
+        mean_ttft_ms=tt_mean,
+        median_ttft_ms=tt_med,
+        std_ttft_ms=tt_std,
+        p99_ttft_ms=tt_p99,
+        mean_tpot_ms=tp_mean,
+        median_tpot_ms=tp_med,
+        std_tpot_ms=tp_std,
+        p99_tpot_ms=tp_p99,
+        mean_itl_ms=tt_mean,  # simplistic
+        median_itl_ms=tt_med,
+        std_itl_ms=tt_std,
+        p99_itl_ms=tt_p99,
+        max_input=max(inputs) if inputs else 0,
+        max_output=max(outputs) if outputs else 0,
+        max_total=(max(inputs) + max(outputs)) if inputs and outputs else 0,
+        peak_gpu_memory_mib=peak_mem,
+        available_gpu_memory_mib=avail_min,
+        gpu_utilization=0.0,  # NVML integration needed
     )
 
 
-@torch.no_grad()
-@torch.inference_mode()
-def measure_throughput(
-    model: torch.nn.Module,
-    dataloader: tud.DataLoader,
-    steps: int,
-    use_profiler: bool = False,
-    profile_path: Path | None = None,
-) -> float:
-    """Run *steps* forward passes and return tokens/s.
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        The model to benchmark (already on correct device).
-    dataloader : DataLoader
-        Yields dicts with ``input_ids`` & ``attention_mask`` on **CPU** or
-        **CUDA** depending on collate_fn.
-    steps : int
-        Number of mini‑batches to benchmark.
-    use_profiler : bool, default False
-        Capture a **torch.profiler** trace for the first 100 steps.
-    profile_path : Path | None
-        Where to dump the trace (.pt); created only if ``use_profiler``.
-    """
-    model.eval()
-
-    if use_profiler:
-        activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-        prof = torch.profiler.profile(
-            activities=activities,
-            schedule=torch.profiler.schedule(wait=10, warmup=10, active=80),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profile_path)),
-            record_shapes=True,
-            with_stack=True,
-            with_flops=True,
-        )
-        prof.__enter__()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-
-    n_tokens = 0
-    for step, batch in enumerate(tqdm(dataloader, total=steps, desc="benchmark")):
-        if step >= steps:
-            break
-        batch = {k: v.to(model.device, non_blocking=True) for k, v in batch.items()}
-        out = model(**batch, use_cache=False)
-        n_tokens += batch["input_ids"].numel()
-        if use_profiler:
-            prof.step()
-
-    end.record()
-    torch.cuda.synchronize()
-    ms = start.elapsed_time(end)
-    tok_per_s = n_tokens / (ms / 1_000)
-
-    if use_profiler:
-        prof.__exit__(None, None, None)
-
-    return tok_per_s
-
-
-# ----------------------------------------------------------------------------
-# Data‑set & loader helpers
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------------
 
 def get_dataset(name: str, seq_len: int, num_samples: int = 4096):
-    """Load a small HF dataset for quick benchmarks."""
-    ds = load_dataset(name, split="train[:{0}]".format(num_samples))
-    return ds
+    return load_dataset(name, split=f"train[:{num_samples}]")
 
 
-def tokenize_function(tokenizer, example, seq_len: int):
-    """Tokenise a text field and trim/pad to *seq_len*."""
-    tokens = tokenizer(example["text"], truncation=True, max_length=seq_len, padding="max_length")
-    return tokens
+def tokenize(example, tokenizer, seq_len: int):
+    return tokenizer(example["text"], truncation=True, max_length=seq_len, padding="max_length")
 
 
-def build_dataloader(
-    ds,
-    tokenizer,
-    seq_len: int,
-    batch_size: int,
-    pin_memory: bool,
-    persistent_workers: bool,
-    collate_cuda: bool,
-):
-    """Return DataLoader with optional *collate‑to‑cuda* semantic."""
-
-    def _collate(batch):
-        batch = default_data_collator(batch)
+def build_dataloader(ds, tokenizer, seq_len, batch_size, pin_mem, persistent, collate_cuda):
+    def _collate(b):
+        b = default_data_collator(b)
         if collate_cuda:
-            return {k: v.to("cuda", non_blocking=True) for k, v in batch.items()}
-        return batch
+            return {k: v.to("cuda", non_blocking=True) for k, v in b.items()}
+        return b
 
-    tokenised = ds.map(partial(tokenize_function, tokenizer, seq_len=seq_len), batched=False)
-    dl = tud.DataLoader(
+    tokenised = ds.map(partial(tokenize, tokenizer=tokenizer, seq_len=seq_len), batched=False)
+    return DataLoader(
         tokenised,
         batch_size=batch_size,
         shuffle=False,
         num_workers=os.cpu_count() // 2,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
+        pin_memory=pin_mem,
+        persistent_workers=persistent,
         collate_fn=_collate,
     )
-    return dl
 
 
-# ----------------------------------------------------------------------------
-# Model builders for each experiment
-# ----------------------------------------------------------------------------
-
-def load_llama_model(device: str, compile_mode: str | None = None):
-    """Load Llama 3.1‑8B in BF16 and prepare according to *compile_mode*.
-
-    compile_mode
-        *None*            – eager.
-        *"thunder"*       – Thunder JIT (requires thunder installed).
-        *"compile"*       – torch.compile (Inductor).
-    """
-    model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
-    config = AutoConfig.from_pretrained(model_name)
-    model = LlamaForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-    ).to(device)
-
-    if compile_mode == "thunder":
-        if thunder is None:
-            raise RuntimeError("thunder not installed – pip install lightning-thunder --pre")
-        model = thunder.jit(
-            model, executors=["sdpa", "torchcompile_cat", "nvfuser", "torch"]
-        )
-    elif compile_mode == "compile":
-        model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
-
-    return model
-
-
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Experiment registry
-# ----------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 Experiment = Callable[[argparse.Namespace], None]
 registry: Dict[str, Experiment] = {}
 
-def register(name: str):
-    def _wrap(fn: Experiment):
+def register(name):
+    def wrap(fn):
         registry[name] = fn
         return fn
-    return _wrap
+    return wrap
+
+
+# Base experiment template
+
+def run_experiment(args, compile_mode=None, pin_mem=False, persistent=False, collate_cuda=False, profile=False):
+    model, tokenizer = load_llama_model(
+        device=args.device,
+        compile_mode=compile_mode,
+        tplr_checkpoint=args.tplr_checkpoint,
+        use_latest=args.use_latest,
+        netuid=args.netuid,
+    )
+    ds = get_dataset(args.dataset, args.seq_len)
+    dl = build_dataloader(ds, tokenizer, args.seq_len, args.batch_size, pin_mem, persistent, collate_cuda)
+
+    profile_path = Path("traces") / f"{args.exp}_{time.time_ns()}" if profile else None
+    metrics = measure_throughput(model, dl, args.steps, use_profiler=profile, profile_path=profile_path)
+
+    # Log to wandb
+    wandb.log(metrics.__dict__)
 
 
 @register("baseline")
 def exp_baseline(args):
-    """Eager BF16 baseline with profiler."""
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct", use_fast=True)
-    ds = get_dataset(args.dataset, args.seq_len)
-    dl = build_dataloader(ds, tokenizer, args.seq_len, args.batch_size, False, False, False)
-
-    model = load_llama_model(args.device)
-
-    tok_s = measure_throughput(
-        model,
-        dl,
-        args.steps,
-        use_profiler=True,
-        profile_path=Path("traces") / f"baseline_{time.time_ns()}",
-    )
-    wandb.log({"tokens_per_second": tok_s})
+    run_experiment(args, profile=True)
 
 
 @register("simple")
 def exp_simple(args):
-    """Apply low‑hanging wins (inference_mode, allocator, cudnn, pinned loader)."""
     torch.backends.cudnn.benchmark = True
-
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct", use_fast=True)
-    ds = get_dataset(args.dataset, args.seq_len)
-    dl = build_dataloader(ds, tokenizer, args.seq_len, args.batch_size, True, True, False)
-
-    model = load_llama_model(args.device)
-
-    tok_s = measure_throughput(model, dl, args.steps)
-    wandb.log({"tokens_per_second": tok_s})
+    run_experiment(args, pin_mem=True, persistent=True)
 
 
 @register("compile")
 def exp_compile(args):
-    """Thunder or torch.compile + FlashAttention (via SDPA)."""
     torch.backends.cuda.enable_flash_sdp(True)
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct", use_fast=True)
-    ds = get_dataset(args.dataset, args.seq_len)
-    dl = build_dataloader(ds, tokenizer, args.seq_len, args.batch_size, True, True, False)
-
-    compile_mode = "thunder" if thunder else "compile"
-    model = load_llama_model(args.device, compile_mode=compile_mode)
-
-    tok_s = measure_throughput(model, dl, args.steps)
-    wandb.log({"tokens_per_second": tok_s, "compile_mode": compile_mode})
+    mode = "thunder" if thunder else "compile"
+    run_experiment(args, compile_mode=mode, pin_mem=True, persistent=True)
 
 
 @register("dataloader")
 def exp_dataloader(args):
-    """Collate‑to‑CUDA & async prefetch using a background stream."""
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct", use_fast=True)
-    ds = get_dataset(args.dataset, args.seq_len)
-    dl = build_dataloader(ds, tokenizer, args.seq_len, args.batch_size, True, True, True)
-
-    model = load_llama_model(args.device)
-
-    tok_s = measure_throughput(model, dl, args.steps)
-    wandb.log({"tokens_per_second": tok_s})
+    run_experiment(args, pin_mem=True, persistent=True, collate_cuda=True)
 
 
 @register("full")
 def exp_full(args):
-    """All optimisations: compile + collate‑cuda + cudnn + streams."""
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.enable_flash_sdp(True)
-
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct", use_fast=True)
-    ds = get_dataset(args.dataset, args.seq_len)
-    dl = build_dataloader(ds, tokenizer, args.seq_len, args.batch_size, True, True, True)
-
-    compile_mode = "thunder" if thunder else "compile"
-    model = load_llama_model(args.device, compile_mode)
-
-    tok_s = measure_throughput(model, dl, args.steps)
-    wandb.log({"tokens_per_second": tok_s, "compile_mode": compile_mode})
+    mode = "thunder" if thunder else "compile"
+    run_experiment(args, compile_mode=mode, pin_mem=True, persistent=True, collate_cuda=True)
 
 
-# ----------------------------------------------------------------------------
-# Main entry
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CLI & entrypoint
+# ---------------------------------------------------------------------------
 
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Llama 3.1‑8B inference speed ablation")
+def parse_args():
+    p = argparse.ArgumentParser(description="Templar Llama speed ablation with live checkpoints")
     p.add_argument("--exp", choices=list(registry), help="experiment name")
     p.add_argument("--device", default="cuda", help="cuda or cpu")
-    p.add_argument("--seq_len", type=int, default=128, help="sequence length")
-    p.add_argument("--batch_size", type=int, default=4, help="mini‑batch size")
+    p.add_argument("--seq_len", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--steps", type=int, default=200, help="forward passes to measure")
-    p.add_argument("--dataset", default="lighteval/lighteval‑tiny", help="HF dataset")
+    p.add_argument("--dataset", default="lighteval/lighteval-tiny")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--tplr_checkpoint", type=str, default=None)
+    p.add_argument("--use_latest", action="store_true")
+    p.add_argument("--netuid", type=int, default=3)
     return p.parse_args()
 
 
@@ -342,14 +418,12 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     Path("traces").mkdir(exist_ok=True)
+    wandb.init(project="templar_llama_speed", name=f"{args.exp}_{time.time_ns()}", config=vars(args))
 
-    log_to_wandb(vars(args))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-    torch.cuda.manual_seed_all(args.seed)
-
-    # dispatch experiment
     registry[args.exp](args)
-
     wandb.finish()
 
 
