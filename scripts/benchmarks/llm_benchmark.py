@@ -436,11 +436,13 @@ def exp_simple(args):
 
 @register("compile")
 def exp_compile(args):
+    torch.set_float32_matmul_precision('medium')
     torch.backends.cuda.enable_flash_sdp(True)
     run_experiment(args, compile_mode="compile", pin_mem=True, persistent=True, inference_mode=True)
 
 @register("thunder")
 def exp_thunder(args):
+    torch.set_float32_matmul_precision('medium')
     torch.backends.cuda.enable_flash_sdp(True)
     run_experiment(args, compile_mode="thunder", pin_mem=True, persistent=True, inference_mode=True)
 
@@ -451,6 +453,7 @@ def exp_dataloader(args):
 
 @register("full")
 def exp_full(args):
+    torch.set_float32_matmul_precision('medium')
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.enable_flash_sdp(True)
     mode = "compile"
