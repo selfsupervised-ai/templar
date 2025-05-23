@@ -40,9 +40,13 @@ dependencies = [
     "hf-xet>=1.1.1",
     "matplotlib>=3.10.1",
     "seaborn>=0.13.2",
+<<<<<<< HEAD
     "jq>=1.8.0",
     "bittensor-cli>=9.4.0",
     "numpy>=2.0.2",
+=======
+    "bittensor-cli>=9.4.0",
+>>>>>>> 93e74b8ce096b77874d5d178232bde048dbca231
 ]
 
 [project.optional-dependencies]
